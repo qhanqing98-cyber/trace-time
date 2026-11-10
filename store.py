@@ -1,20 +1,120 @@
 """数据层：待办、时间段记录、设置的读写、统计与变更通知。
 
-所有数据都存在 data/trace_time.json 里，纯文本、可备份、可手工编辑。
+数据文件位置的规则（这也是"bat 运行 vs exe 运行数据不一致"的修复点）：
+
+1. `--data 路径` 或环境变量 `TRACE_TIME_DATA` 显式指定时，用指定的；
+2. 程序目录里有 `portable.txt` → 便携模式，数据放程序目录下的 `data/`；
+3. 其余情况 → `%LOCALAPPDATA%\\TraceTime\\trace_time.json`。
+   注意：**默认不放在程序目录**，因为 PyInstaller 打包后 `__file__` 会指向
+   `_internal`（一次性/随包目录），bat 运行和 exe 运行就会各存一份。
+   放到用户目录后，两种启动方式天然共用同一份数据。
+
+旧版本的散落数据（项目的 data/、exe 的 _internal/data/ 等）会在第一次启动时
+按 id 合并进主文件，合并过哪些文件记在 `merged_from` 里，不会重复合并。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import uuid
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
-DATA_FILE = DATA_DIR / "trace_time.json"
+APP_NAME = "TraceTime"
+
+SOURCE_DIR = Path(__file__).resolve().parent
+
+
+def program_dir() -> Path:
+    """exe 所在目录（打包后）；源码运行时是项目目录。"""
+    if getattr(sys, "frozen", False):
+        try:
+            return Path(sys.executable).resolve().parent
+        except OSError:
+            pass
+    return SOURCE_DIR
+
+
+def user_data_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if base:
+        return Path(base) / APP_NAME
+    return Path.home() / ("." + APP_NAME.lower())
+
+
+def _writable(directory: Path) -> bool:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _as_data_file(value) -> Path:
+    """允许传文件路径或目录。"""
+    path = Path(value).expanduser()
+    if path.suffix.lower() == ".json":
+        return path
+    return path / "data" / "trace_time.json"
+
+
+def resolve_data_file(override=None, portable=None) -> Path:
+    """算出这次该用哪个数据文件。"""
+    explicit = override or os.environ.get("TRACE_TIME_DATA") or os.environ.get("TRACE_TIME_DATA_DIR")
+    if explicit:
+        return _as_data_file(explicit)
+
+    prog = program_dir()
+    if portable is None:
+        portable = (prog / "portable.txt").exists()
+    if portable:
+        return prog / "data" / "trace_time.json"
+
+    home = user_data_dir()
+    if _writable(home):
+        return home / "trace_time.json"
+    return prog / "data" / "trace_time.json"
+
+
+DATA_FILE = resolve_data_file()
+DATA_DIR = DATA_FILE.parent
+
+
+def legacy_data_files(canonical: Path):
+    """可能藏着旧数据的文件（按 id 合并用）。"""
+    candidates = [
+        SOURCE_DIR / "data" / "trace_time.json",
+        program_dir() / "data" / "trace_time.json",
+        program_dir() / "_internal" / "data" / "trace_time.json",
+        Path.cwd() / "data" / "trace_time.json",
+        user_data_dir() / "data" / "trace_time.json",
+    ]
+    try:
+        canonical_key = str(canonical.resolve()).lower()
+    except OSError:
+        canonical_key = str(canonical).lower()
+    seen, out = set(), []
+    for path in candidates:
+        try:
+            key = str(path.resolve()).lower()
+        except OSError:
+            key = str(path).lower()
+        if key == canonical_key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            if path.is_file():
+                out.append(path)
+        except OSError:
+            continue
+    return out
+
 
 PRIORITIES = ("high", "mid", "low")
 PRIORITY_LABEL = {"high": "高", "mid": "中", "low": "低"}
@@ -64,10 +164,18 @@ def fmt_span(seconds):
 
 
 class Store:
-    def __init__(self, path=None):
+    def __init__(self, path=None, migrate=True):
         self.path = Path(path) if path else DATA_FILE
         self._listeners = []
+        self.fresh = not self.path.exists()
         self.data = self._load()
+        if migrate:
+            self._merge_legacy()
+        self._write_startup_log()
+
+    @property
+    def data_path(self):
+        return self.path
 
     # ------------------------------------------------------------------ 基础
     @staticmethod
@@ -91,6 +199,8 @@ class Store:
         for key in ("todos", "segments"):
             if isinstance(raw.get(key), list):
                 data[key] = [r for r in raw[key] if isinstance(r, dict)]
+        if isinstance(raw.get("merged_from"), list):
+            data["merged_from"] = [x for x in raw["merged_from"] if isinstance(x, str)]
         settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
         for key, val in DEFAULT_SETTINGS.items():
             if isinstance(val, dict):
@@ -103,6 +213,77 @@ class Store:
                 data["settings"][key] = settings.get(key, deepcopy(val))
         data["version"] = raw.get("version", 1)
         return data
+
+    def _merge_legacy(self):
+        """把旧版本散落在别处的数据并进来（按 id 去重，只并一次）。"""
+        done = self.data.setdefault("merged_from", [])
+        changed = False
+
+        if self.fresh:
+            # 第一次用新位置：优先继承数据最多的那份的偏好设置
+            best, best_score = None, -1
+            for path in legacy_data_files(self.path):
+                raw = self._read_json(path)
+                if not raw:
+                    continue
+                score = len(raw.get("segments") or []) + len(raw.get("todos") or [])
+                if score > best_score:
+                    best, best_score = raw, score
+            if best:
+                self._adopt_settings(best.get("settings"))
+                changed = True
+
+        for path in legacy_data_files(self.path):
+            key = str(path)
+            if key in done:
+                continue
+            raw = self._read_json(path)
+            done.append(key)
+            changed = True
+            if not raw:
+                continue
+            for field in ("segments", "todos"):
+                existing = {rec.get("id") for rec in self.data.get(field) or [] if isinstance(rec, dict)}
+                for rec in raw.get(field) or []:
+                    if isinstance(rec, dict) and rec.get("id") and rec.get("id") not in existing:
+                        self.data.setdefault(field, []).append(rec)
+                        existing.add(rec.get("id"))
+        if changed:
+            self.save()
+
+    @staticmethod
+    def _read_json(path):
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else None
+        except Exception:
+            return None
+
+    def _adopt_settings(self, settings):
+        if not isinstance(settings, dict):
+            return
+        for key, default in DEFAULT_SETTINGS.items():
+            src = settings.get(key)
+            if isinstance(default, dict) and isinstance(src, dict):
+                target = self.data["settings"][key]
+                target.update({k: v for k, v in src.items() if k in default})
+            elif src is not None:
+                self.data["settings"][key] = src
+
+    def _write_startup_log(self):
+        """记一行启动日志，方便确认两种启动方式到底用的哪个数据文件。"""
+        try:
+            log = self.path.parent / "startup.log"
+            if log.exists() and log.stat().st_size > 128 * 1024:
+                log.unlink()
+            mode = "exe(打包)" if getattr(sys, "frozen", False) else "源码"
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write("%s  启动=%s  数据=%s  记录=%d 待办=%d\n"
+                         % (stamp, mode, self.path, len(self.data.get("segments") or []),
+                            len(self.data.get("todos") or [])))
+        except OSError:
+            pass
 
     def save(self):
         try:

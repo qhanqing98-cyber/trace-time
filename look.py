@@ -51,7 +51,7 @@ class LookPanel(tk.Toplevel):
         self.configure(bg=C["card"])
         self.resizable(False, False)
         self.transient(app)
-        self._cw, self._ch = sp(430), sp(600)
+        self._cw, self._ch = sp(430), sp(700)
         self._build()
         if geometry:
             self.geometry(geometry)
@@ -139,9 +139,28 @@ class LookPanel(tk.Toplevel):
                  font=F["tiny"], bg=C["card"], fg=C["mute"], anchor="w",
                  wraplength=sp(370), justify="left").pack(fill="x", pady=(sp(6), 0))
 
-        RoundButton(wrap, "恢复默认", command=self._reset, width=110, height=34,
+        divider(wrap, pady=(sp(12), sp(8)))
+        tk.Label(wrap, text="数据文件（bat 和 exe 都用这一份）", font=F["small"],
+                 bg=C["card"], fg=C["mute"], anchor="w").pack(fill="x")
+        tk.Label(wrap, text=str(self.app.store.path), font=F["tiny"], bg=C["card"],
+                 fg=C["dim"], anchor="w", justify="left",
+                 wraplength=sp(380)).pack(fill="x", pady=(sp(2), sp(6)))
+        RoundButton(wrap, "打开数据文件夹", command=self._open_folder, width=142, height=32,
+                    bg=C["card3"], fg=C["dim"], parent_bg=C["card"]).pack(anchor="w")
+
+        RoundButton(wrap, "恢复默认外观", command=self._reset, width=130, height=34,
                     bg=C["card3"], fg=C["dim"], parent_bg=C["card"]).pack(
             side="bottom", anchor="w", pady=(sp(8), 0))
+
+    def _open_folder(self):
+        import os
+
+        try:
+            folder = self.app.store.path.parent
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(folder))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ 事件
     def _on_alpha(self, value):

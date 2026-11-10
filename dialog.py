@@ -9,19 +9,28 @@ import winfx
 
 
 class Modal(tk.Toplevel):
-    """居中的模态窗（深色标题栏 + 圆角）。"""
+    """居中的模态窗（深色标题栏 + 圆角）。
+
+    模态处理得非常保守，宁可少抓一次鼠标，也绝不把主界面锁死：
+    - 挂在**主窗口**下面，不挂在某个视图里（视图重建/销毁不会带走弹窗）；
+    - 等窗口真的显示出来再 grab_set()，抓不到就反复试几次，最后仍失败就干脆不抓
+      （弹窗有 transient + topmost，依然在最前面，主界面也还能点）；
+    - 整段逻辑包在 try/finally 里，任何异常都会释放模态并销毁窗口；
+    - 位置限制在屏幕内，避免弹出到屏幕外看不见。
+    """
 
     def __init__(self, parent, title="", width=560, height=400):
-        super().__init__(parent)
+        root = parent.winfo_toplevel()
+        super().__init__(root)
+        self._root_win = root
         self.withdraw()
         self.title(title)
         self.configure(bg=C["card"])
         self.resizable(False, False)
-        self.transient(parent.winfo_toplevel())
+        self.transient(root)
         self.result = None
         self._dw, self._dh = sp(width), sp(height)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.after(30, self._paint_frame)
 
     def _paint_frame(self):
         hwnd = winfx.hwnd_of(self)
@@ -31,22 +40,70 @@ class Modal(tk.Toplevel):
 
     def _place(self):
         self.update_idletasks()
-        root = self.master.winfo_toplevel()
+        root = self._root_win
         x = root.winfo_rootx() + max(0, (root.winfo_width() - self._dw) // 2)
         y = root.winfo_rooty() + max(0, (root.winfo_height() - self._dh) // 3)
+        max_x = self.winfo_screenwidth() - self._dw - sp(12)
+        max_y = self.winfo_screenheight() - self._dh - sp(48)
+        x = max(sp(6), min(x, max_x))
+        y = max(sp(6), min(y, max_y))
         self.geometry("%dx%d+%d+%d" % (self._dw, self._dh, x, y))
 
+    def _grab_when_viewable(self, attempts=24):
+        """等窗口可见了再抓模态；一直不可见就放弃抓取（不阻塞主界面）。"""
+        if not self.winfo_exists():
+            return
+        try:
+            viewable = self.winfo_viewable()
+        except tk.TclError:
+            return
+        if viewable:
+            try:
+                self.grab_set()
+            except tk.TclError:
+                pass
+            return
+        if attempts > 0:
+            self.after(50, lambda: self._grab_when_viewable(attempts - 1))
+
     def show(self):
-        self._place()
-        self.deiconify()
-        self.grab_set()
-        self.focus_force()
-        self.wait_window()
-        return self.result
+        try:
+            self._place()
+            self.deiconify()
+            self.lift()
+            try:
+                self.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            self._grab_when_viewable()
+            self.after(60, self._paint_frame)
+            try:
+                self.focus_force()
+            except tk.TclError:
+                pass
+            self.wait_window()
+            return self.result
+        finally:
+            self._cleanup()
+
+    def _cleanup(self):
+        try:
+            if self.winfo_exists():
+                try:
+                    self.grab_release()
+                except tk.TclError:
+                    pass
+                try:
+                    self.attributes("-topmost", False)
+                except tk.TclError:
+                    pass
+                self.destroy()
+        except tk.TclError:
+            pass
 
     def _cancel(self):
         self.result = None
-        self.destroy()
+        self._cleanup()
 
 
 class NoteDialog(Modal):
@@ -264,3 +321,4 @@ class TodoDialog(Modal):
             "tag": self.tag_entry.get().strip(),
         }
         self.destroy()
+

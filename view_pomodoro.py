@@ -27,6 +27,7 @@ class PomodoroView(tk.Frame):
         self._last = 0.0
         self._after = None
         self._last_draw_sec = None
+        self._asking = False
         self._build()
         self.set_phase("focus")
         self.refresh()
@@ -199,18 +200,17 @@ class PomodoroView(tk.Frame):
 
     def _skip(self):
         self.running = False
-        self._advance(log=False)
+        self._advance(self.phase, count=False)
 
     def _reset(self):
         self.running = False
         self.set_phase("focus")
 
-    def _advance(self, log=True):
-        finished = self.phase
+    def _advance(self, finished, count=True):
+        """只做阶段切换，不弹任何窗（弹窗交给下游的 after，避免卡住计时回调）。"""
         long_every = max(1, int(self.store.pomo().get("long_every", 4)))
         if finished == "focus":
-            if log:
-                self._log_focus()
+            if count:
                 self.cycle += 1
             if self.cycle >= long_every:
                 next_phase = "long"
@@ -226,15 +226,23 @@ class PomodoroView(tk.Frame):
         if auto:
             self._last = time.monotonic()
 
-    def _log_focus(self):
-        end = datetime.now()
-        start = end - timedelta(seconds=int(self.total))
-        dlg = NoteDialog(self, start=start, end=end, seconds=int(self.total),
-                         tags=self.store.tags(), recent=self.store.recent_notes(3), source="番茄钟")
-        res = dlg.show()
-        if res is None:
+    def _ask_focus_note(self, start, end, seconds):
+        """番茄结束后补记内容；这一步可能在另一个事件轮回里执行，所以格外小心。"""
+        if self._asking:
+            # 上一条还没填完，别再叠一个弹窗——先把这段时间记下来，内容留空
+            self.store.add_segment(start, end, note="", tag="", source="pomodoro")
             return
-        self.store.add_segment(start, end, note=res["note"], tag=res["tag"], source="pomodoro")
+        self._asking = True
+        try:
+            dlg = NoteDialog(self, start=start, end=end, seconds=seconds,
+                             tags=self.store.tags(), recent=self.store.recent_notes(3),
+                             source="番茄钟")
+            res = dlg.show()
+            if res is None:
+                return
+            self.store.add_segment(start, end, note=res["note"], tag=res["tag"], source="pomodoro")
+        finally:
+            self._asking = False
 
     def _apply_settings(self):
         for key, var in self.spin.items():
@@ -268,10 +276,25 @@ class PomodoroView(tk.Frame):
         self._draw()
 
     def _on_phase_end(self):
+        finished = self.phase
+        seconds = int(self.total)
+        end = datetime.now()
+        start = end - timedelta(seconds=seconds)
         if bool(self.store.pomo().get("sound", True)):
             self._beep()
-        self._advance(log=self.phase == "focus")
+        # 先把状态推进到下一阶段（计时继续跑），再另起一个空闲回合去问「做了什么」
+        self._advance(finished)
         self.refresh()
+        if finished != "focus":
+            return
+        if self.app is not None:
+            try:
+                if self.app.state() == "iconic":
+                    self.app.deiconify()
+                    self.app.lift()
+            except tk.TclError:
+                pass
+        self.after(60, lambda: self._ask_focus_note(start, end, seconds))
 
     def _beep(self):
         if self.app is not None and hasattr(self.app, "notify_user"):

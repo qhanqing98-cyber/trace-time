@@ -88,6 +88,8 @@ class App(tk.Tk):
         self.show_view("timer")
         self.update_summary()
         self.after(80, self._apply_window_material)
+        self._modal_strikes = 0
+        self.after(2000, self._modal_watchdog)
 
     # ------------------------------------------------------------------ 布局
     def _build(self):
@@ -298,6 +300,46 @@ class App(tk.Tk):
         self.apply_alpha()
         self.apply_blur()
 
+    # ------------------------------------------------------------------ 兜底
+    def _modal_watchdog(self):
+        """看门狗：万一有弹窗握着模态却看不见（主界面点不动、关不掉），把它清掉。
+
+        连续两次（约 4 秒）都不可见才动手，避免误伤正常弹窗。
+        """
+        self.after(2000, self._modal_watchdog)
+        try:
+            holder = self.grab_current()
+        except Exception:
+            holder = None
+        if not isinstance(holder, tk.Toplevel):
+            self._modal_strikes = 0
+            return
+        try:
+            if holder.winfo_exists() and not holder.winfo_viewable():
+                self._modal_strikes += 1
+                if self._modal_strikes >= 2:
+                    self._modal_strikes = 0
+                    try:
+                        holder.grab_release()
+                    except tk.TclError:
+                        pass
+                    holder.destroy()
+                    self._log_to_startup("清理了一个不可见的模态弹窗")
+            else:
+                self._modal_strikes = 0
+        except tk.TclError:
+            self._modal_strikes = 0
+
+    def _log_to_startup(self, message):
+        try:
+            path = self.store.path.parent / "startup.log"
+            from datetime import datetime
+
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write("%s  %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message))
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ 提醒
     def notify_user(self):
         try:
@@ -334,6 +376,17 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ 退出
     def _on_close(self):
+        # 先清掉可能还开着的弹窗，免得它握着模态导致后面问询弹不出来
+        for child in list(self.winfo_children()):
+            if isinstance(child, tk.Toplevel):
+                try:
+                    child.grab_release()
+                except tk.TclError:
+                    pass
+                try:
+                    child.destroy()
+                except tk.TclError:
+                    pass
         timer = self.views["timer"]
         if timer.has_open_segment():
             choice = ask_choice(
