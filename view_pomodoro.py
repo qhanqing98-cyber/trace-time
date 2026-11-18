@@ -28,6 +28,8 @@ class PomodoroView(tk.Frame):
         self._after = None
         self._last_draw_sec = None
         self._asking = False
+        self._arc_prog = None
+        self._list_key = None
         self._build()
         self.set_phase("focus")
         self.refresh()
@@ -54,6 +56,7 @@ class PomodoroView(tk.Frame):
         size = sp(self.RING)
         self.ring = tk.Canvas(body, width=size, height=size, bg=C["card"], highlightthickness=0, bd=0)
         self.ring.pack(pady=(sp(12), sp(6)))
+        self._ring_reset()
 
         btns = tk.Frame(body, bg=C["card"])
         btns.pack(pady=(sp(4), 0))
@@ -155,36 +158,59 @@ class PomodoroView(tk.Frame):
         self.cycle_lbl.configure(text="第 %d / %d 个番茄" % (min(shown, long_every), long_every))
         self._draw(force=True)
 
-    def _draw(self, force=False):
-        sec = int(self.remaining + 0.999)
-        if not force and sec == self._last_draw_sec:
-            return
-        self._last_draw_sec = sec
+    def _ring_reset(self):
+        """环上的图形只建一次，之后每秒只改属性。
+
+        原来每秒 delete("all") 再整块重画，等于每秒让这个 300px 画布全部失效一次，
+        整窗跟着重新合成——这才是「跑起来一顿一顿」的来源。
+        """
         c = self.ring
         c.delete("all")
         size = sp(self.RING)
         pad = sp(26)
         thick = sp(14)
         accent = C[PHASE_KEY[self.phase][1]]
-        c.create_arc(pad, pad, size - pad, size - pad, start=90, extent=-359.9, style="arc",
-                     outline=mix(C["card"], "#ffffff", 0.08), width=thick)
-        frac = 0.0 if not self.total else max(0.0, min(1.0, 1 - self.remaining / self.total))
-        if frac > 0.001:
-            c.create_arc(pad, pad, size - pad, size - pad, start=90, extent=-359.9 * frac,
-                         style="arc", outline=accent, width=thick)
-        c.create_text(size / 2, size / 2 - sp(10), text=fmt_clock(sec), font=F["pomo"], fill=C["text"])
-        c.create_text(size / 2, size / 2 + sp(34), text=PHASE_KEY[self.phase][0],
-                      font=F["small"], fill=C["dim"])
+        self._arc_track = c.create_arc(pad, pad, size - pad, size - pad, start=90, extent=-359.9,
+                                       style="arc", outline=mix(C["card"], "#ffffff", 0.08),
+                                       width=thick)
+        self._arc_prog = c.create_arc(pad, pad, size - pad, size - pad, start=90, extent=-0.1,
+                                      style="arc", outline=accent, width=thick)
+        self._txt_clock = c.create_text(size / 2, size / 2 - sp(10), text="--:--",
+                                        font=F["pomo"], fill=C["text"])
+        self._txt_phase = c.create_text(size / 2, size / 2 + sp(34), text="",
+                                        font=F["small"], fill=C["dim"])
+        self._dots = []
         long_every = max(1, int(self.store.pomo().get("long_every", 4)))
         dots = min(long_every, 8)
         step = sp(16)
         x0 = size / 2 - (dots - 1) * step / 2
         y = size - sp(46)
+        r = sp(4)
         for i in range(dots):
-            filled = i < self.cycle
-            r = sp(4)
-            c.create_oval(x0 + i * step - r, y - r, x0 + i * step + r, y + r,
-                          fill=accent if filled else mix(C["card"], "#ffffff", 0.12), outline="")
+            self._dots.append(
+                c.create_oval(x0 + i * step - r, y - r, x0 + i * step + r, y + r,
+                              fill=mix(C["card"], "#ffffff", 0.12), outline=""))
+
+    def _draw(self, force=False):
+        sec = int(self.remaining + 0.999)
+        if not force and sec == self._last_draw_sec:
+            return
+        self._last_draw_sec = sec
+        if self._arc_prog is None:
+            self._ring_reset()
+        c = self.ring
+        accent = C[PHASE_KEY[self.phase][1]]
+        frac = 0.0 if not self.total else max(0.0, min(1.0, 1 - self.remaining / self.total))
+        if frac <= 0.001:
+            c.itemconfigure(self._arc_prog, extent=-0.1)
+        else:
+            c.itemconfigure(self._arc_prog, extent=-359.9 * frac)
+        c.itemconfigure(self._arc_prog, outline=accent)
+        c.itemconfigure(self._txt_clock, text=fmt_clock(sec))
+        c.itemconfigure(self._txt_phase, text=PHASE_KEY[self.phase][0])
+        for i, item in enumerate(self._dots):
+            c.itemconfigure(item, fill=accent if i < self.cycle
+                            else mix(C["card"], "#ffffff", 0.12))
 
     def _toggle(self):
         if self.running:
@@ -199,8 +225,14 @@ class PomodoroView(tk.Frame):
         self._draw(force=True)
 
     def _skip(self):
-        self.running = False
-        self._advance(self.phase, count=False)
+        # 一颗番茄刚结束、记录弹窗还没弹出来的空窗里，phase 已推进到休息，
+        # 但 _asking 仍为 True。此时「跳过」应作用于刚结束的那颗专注，而不是休息。
+        if self.phase == "focus" or self._asking:
+            self.running = False
+            self._advance("focus", count=False)
+        else:
+            self.running = False
+            self._advance(self.phase, count=False)
 
     def _reset(self):
         self.running = False
@@ -255,8 +287,12 @@ class PomodoroView(tk.Frame):
             self.store.set_pomo(key, val)
         self.store.set_pomo("auto_next", bool(self.auto_var.get()))
         self.store.set_pomo("sound", bool(self.sound_var.get()))
+        # 「长休间隔」改了，环下的点位数也要跟着变，重建一次环上的图形
+        self._ring_reset()
         if not self.running:
             self.set_phase(self.phase)
+        else:
+            self._draw(force=True)
 
     # ------------------------------------------------------------------ 循环
     def _tick(self):
@@ -339,8 +375,13 @@ class PomodoroView(tk.Frame):
         self._fill_list(day)
 
     def _fill_list(self, day):
-        self.list.clear()
         segs = [s for s in self.store.segments(day) if s.get("source") == "pomodoro"]
+        key = (day, tuple((s.get("id"), s.get("start"), s.get("end"), s.get("seconds"),
+                           s.get("note")) for s in segs))
+        if key == self._list_key:
+            return
+        self._list_key = key
+        self.list.clear()
         if not segs:
             tk.Label(self.list.inner, text="今天还没有完成的番茄。", font=F["small"],
                      bg=C["card"], fg=C["mute"]).pack(anchor="w", padx=sp(6), pady=sp(18))

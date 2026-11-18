@@ -67,6 +67,9 @@ class NavButton(tk.Frame):
 class App(tk.Tk):
     def __init__(self, store=None):
         super().__init__()
+        # 先把窗口藏起来：控件全部搭好、材质全部设好，最后才一次性显形。
+        # 否则用户会先看到一块黑底，然后字一块块画上去。
+        self.withdraw()
         self.store = store or Store()
         self.look = dict(LOOK_DEFAULT)
         self.look.update(self.store.look())
@@ -81,15 +84,18 @@ class App(tk.Tk):
         self._look_panel = None
         self._pomo_snap = None
         self._cal_day = None
+        self._applied_alpha = None
+        self._applied_blur = None
         self._build()
         self.store.subscribe(self._on_data_changed)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._bind_keys()
-        self.show_view("timer")
+        self._build_all_views()
+        self.show_view(self._current)
         self.update_summary()
-        self.after(80, self._apply_window_material)
         self._modal_strikes = 0
         self.after(2000, self._modal_watchdog)
+        self._reveal()
 
     # ------------------------------------------------------------------ 布局
     def _build(self):
@@ -158,6 +164,25 @@ class App(tk.Tk):
         if key == "pomodoro" and self._pomo_snap:
             view.restore(self._pomo_snap)
         return view
+
+    def _build_all_views(self):
+        """启动时把四个视图一次建好——趁窗口还没显形。
+
+        这台机器上 Tk 建/排一个视图要 150–250 ms，放在点导航的那一刻就是「卡一下」，
+        放在显形之前就只是一次稍长的冷启动；之后每个页面切换只剩重绘的 30 ms 左右。
+        """
+        current = self._current
+        for key in self.VIEW_CLASSES:
+            try:
+                self._ensure_view(key)
+            except Exception as exc:
+                print("[app] 预建视图失败:", key, exc)
+        view = self.views.get(current)
+        if view is not None:
+            try:
+                view.tkraise()
+            except tk.TclError:
+                pass
 
     def show_view(self, key):
         if key not in self.VIEW_CLASSES:
@@ -265,9 +290,7 @@ class App(tk.Tk):
             self.views["timer"].restore(state["timer"])
         self.show_view(state["view"])
         self.update_summary()
-        self.apply_alpha()
-        self.apply_blur()
-        self._apply_window_material()
+        self._apply_window_material()  # 底色可能变了，毛玻璃的色调得跟着换
         if state["panel"]:
             geometry = state["panel"]
             self.after(30, lambda g=geometry: self._reopen_panel(g))
@@ -277,16 +300,37 @@ class App(tk.Tk):
             self._look_panel = LookPanel(self, self, self.look, geometry)
 
     def apply_alpha(self):
+        """设窗口透明度。
+
+        两点讲究：
+        · 值等于 1.0 就干脆不要分层窗口——分层窗口会关掉 ClearType，字看着发糊，
+          而且每次重绘都要 DWM 重新合成一遍，这就是「不流畅」的主要来源。
+        · 值没变就不要再设一次，每设一次都会触发一次整窗重新合成。
+        """
+        value = max(0.55, min(1.0, float(self.look.get("alpha", 0.96))))
+        if value >= 0.995:
+            value = 1.0
+        if self._applied_alpha == value:
+            return
         try:
-            self.attributes("-alpha", max(0.55, min(1.0, float(self.look.get("alpha", 0.96)))))
+            self.attributes("-alpha", value)
+            self._applied_alpha = value
         except tk.TclError:
-            pass
+            return
+        if value >= 1.0:
+            winfx.unlayer(self)          # 摘掉分层标记，文字才回到 ClearType
+        else:
+            winfx.set_layered(self, value)
 
     def apply_blur(self):
         hwnd = winfx.hwnd_of(self)
         if not hwnd:
             return
-        if self.look.get("blur", True):
+        want = (bool(self.look.get("blur", True)), C["bg"])
+        if self._applied_blur == want:
+            return
+        self._applied_blur = want
+        if want[0]:
             winfx.blur(hwnd, C["bg"], BLUR_STRENGTH)
         else:
             winfx.clear_blur(hwnd)
@@ -297,8 +341,35 @@ class App(tk.Tk):
             return
         winfx.dark_titlebar(hwnd)
         winfx.round_window(hwnd)
+        self._applied_alpha = None
+        self._applied_blur = None
         self.apply_alpha()
         self.apply_blur()
+
+    def _reveal(self):
+        """把「第一帧」凑齐再显形，避免打开时先黑一块、字再一块块冒出来。
+
+        顺序：内容全部建好 → 用 0 不透明度把窗口映射出来（看不见但已开始排版）
+        → 跑完一轮事件，让 Tk 把每个控件都画进后台缓冲 → 设窗口材质（深色标题栏 /
+        圆角 / 毛玻璃）→ 最后一步把不透明度抬到目标值。用户只会看到一帧完整的界面。
+        """
+        try:
+            self.update_idletasks()
+            self.attributes("-alpha", 0.0)
+            self.deiconify()
+            self.update()
+            self._apply_window_material()
+        except tk.TclError:
+            pass
+        self.apply_alpha()  # 无论前面成没成，都必须把不透明度恢复回来
+
+    def set_clear_mode(self):
+        """一键「清晰模式」：关掉透明与毛玻璃。
+
+        界面内容本来就是不透明的，这两项只影响窗口背后透出来的那点桌面；
+        关掉之后文字恢复 ClearType、不再有逐帧合成，是最省的一档。
+        """
+        self.set_look(alpha=1.0, blur=False)
 
     # ------------------------------------------------------------------ 兜底
     def _modal_watchdog(self):

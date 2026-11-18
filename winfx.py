@@ -95,3 +95,51 @@ def blur(hwnd, rgb="#101116", strength=0x8c):
 
 def clear_blur(hwnd):
     return _accent(hwnd, ACCENT_DISABLED, 0)
+
+
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+SWP_FLAGS = 0x0002 | 0x0001 | 0x0004 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+
+
+def unlayer(widget):
+    """把 WS_EX_LAYERED 去掉。
+
+    Tk 的 -alpha 一旦设过小于 1 的值，窗口就永久带上了 WS_EX_LAYERED；
+    以后就算把 -alpha 设回 1.0，分层标记也还在——那意味着文字一直用不了
+    ClearType、每帧都多一层合成。所以「不透明」这一档必须手动摘掉它。
+    """
+    hwnd = widget if isinstance(widget, int) else hwnd_of(widget)
+    if not hwnd:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE)
+        if not style & WS_EX_LAYERED:
+            return True
+        user32.SetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE, style & ~WS_EX_LAYERED)
+        user32.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, 0, 0, SWP_FLAGS)
+        return True
+    except Exception:
+        return False
+
+
+def set_layered(widget, alpha):
+    """自己把分层标记装回去并设不透明度（0~1）。
+
+    摘过一次 WS_EX_LAYERED 之后，Tk 再把 -alpha 设成小于 1 也不会重新分层，
+    滑杆就会「怎么拖都没变化」。所以这里两边都对齐一下。
+    """
+    hwnd = widget if isinstance(widget, int) else hwnd_of(widget)
+    if not hwnd:
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE)
+        if not style & WS_EX_LAYERED:
+            user32.SetWindowLongW(ctypes.c_void_p(hwnd), GWL_EXSTYLE, style | WS_EX_LAYERED)
+            user32.SetWindowPos(ctypes.c_void_p(hwnd), None, 0, 0, 0, 0, SWP_FLAGS)
+        level = max(0, min(255, int(round(float(alpha) * 255))))
+        return bool(user32.SetLayeredWindowAttributes(ctypes.c_void_p(hwnd), 0, level, 0x00000002))
+    except Exception:
+        return False

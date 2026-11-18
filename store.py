@@ -20,7 +20,7 @@ import os
 import sys
 import uuid
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 APP_NAME = "TraceTime"
@@ -383,24 +383,52 @@ class Store:
 
     # ------------------------------------------------------------ 时间段记录
     def add_segment(self, start, end, note="", tag="", source="timer"):
-        seconds = int((end - start).total_seconds())
-        if seconds < 1:
-            seconds = 1
-        rec = {
-            "id": uuid.uuid4().hex[:12],
-            "date": start.date().isoformat(),
-            "start": start.strftime("%H:%M"),
-            "end": end.strftime("%H:%M"),
-            "seconds": seconds,
-            "note": (note or "").strip(),
-            "tag": (tag or "").strip(),
-            "source": source,
-            "ts": start.isoformat(timespec="seconds"),
-        }
-        self.data["segments"].append(rec)
+        total = int((end - start).total_seconds())
+        if total < 1:
+            # 时钟回拨等异常导致 end<=start：兜底成 1 秒，挂在开始那天
+            end = start + timedelta(seconds=1)
+            total = 1
+        note = (note or "").strip()
+        tag = (tag or "").strip()
+
+        # 跨午夜（甚至跨多天）时按自然日切分，每段归到它实际发生的那天，
+        # 避免整段时长全记到开始日、结束日却看不到。
+        pieces = []
+        cur = start
+        while cur.date() < end.date():
+            midnight = datetime.combine(cur.date() + timedelta(days=1), time.min)
+            pieces.append((cur, midnight))
+            cur = midnight
+        pieces.append((cur, end))
+
+        # 逐段取整，把舍入误差补给最后一段，保证各段之和 == 总时长
+        secs = [int((b - a).total_seconds()) for a, b in pieces]
+        secs[-1] += total - sum(secs)
+
+        # 跨天拆出的多段共享一个 group：时长各归各日，但「一颗番茄」仍只算一个。
+        group = uuid.uuid4().hex[:12] if len(pieces) > 1 else None
+        recs = []
+        for (a, b), sec in zip(pieces, secs):
+            if sec < 1:
+                continue
+            rec = {
+                "id": uuid.uuid4().hex[:12],
+                "date": a.date().isoformat(),
+                "start": a.strftime("%H:%M"),
+                "end": b.strftime("%H:%M"),
+                "seconds": sec,
+                "note": note,
+                "tag": tag,
+                "source": source,
+                "ts": a.isoformat(timespec="seconds"),
+            }
+            if group:
+                rec["group"] = group
+            self.data["segments"].append(rec)
+            recs.append(rec)
         self.save()
         self.notify()
-        return rec
+        return recs[0] if recs else None
 
     def segments(self, day=None):
         segs = self.data["segments"]
@@ -408,11 +436,25 @@ class Store:
             return list(segs)
         return [s for s in segs if s.get("date") == day]
 
+    @staticmethod
+    def _pomo_units(segs):
+        """番茄「颗数」：跨天拆出的同源片段（共享 group）只算一颗。"""
+        seen, n = set(), 0
+        for s in segs:
+            if s.get("source") != "pomodoro":
+                continue
+            g = s.get("group")
+            if g:
+                if g in seen:
+                    continue
+                seen.add(g)
+            n += 1
+        return n
+
     def day_stats(self, day):
         segs = self.segments(day)
         total = sum(int(s.get("seconds", 0)) for s in segs)
-        pomo = sum(1 for s in segs if s.get("source") == "pomodoro")
-        return {"seconds": total, "count": len(segs), "pomodoro": pomo}
+        return {"seconds": total, "count": len(segs), "pomodoro": self._pomo_units(segs)}
 
     def month_stats(self, year=None, month=None):
         out = {}
@@ -437,8 +479,7 @@ class Store:
         return sum(int(s.get("seconds", 0)) for s in rows)
 
     def pomodoro_count(self, day=None):
-        rows = self.segments(day)
-        return sum(1 for s in rows if s.get("source") == "pomodoro")
+        return self._pomo_units(self.segments(day))
 
     def delete_segment(self, sid):
         before = len(self.data["segments"])

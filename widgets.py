@@ -52,22 +52,53 @@ class Glass(tk.Canvas):
         self._radius = max(sp(6), min(want, self._padx, self._pady))
         self._sheen = sheen
         self._req = (0, 0)
+        self._geom = None
         self.body = tk.Frame(self, bg=self.fill)
         self.body.place(x=self._padx, y=self._pady)
         self.bind("<Configure>", self._on_configure)
         self.body.bind("<Configure>", self._sync_request)
 
     # ------------------------------------------------------------ 尺寸协商
+    def _stretched(self):
+        """哪个方向已经被几何管理器撑开了。
+
+        撑开的那个方向再报尺寸没有任何好处，只会让 pack/grid 再排一遍整窗，
+        而这一版 Tk 排一次就要几十毫秒——两边都报，一次布局能拖成三四轮。
+        """
+        try:
+            manager = self.winfo_manager()
+            if manager == "pack":
+                info = self.pack_info()
+                fill = info.get("fill", "none")
+                expand = str(info.get("expand", "0")) not in ("0", "")
+                return (fill in ("x", "both") or expand, fill in ("y", "both") or expand)
+            if manager == "grid":
+                sticky = str(self.grid_info().get("sticky", ""))
+                return ("e" in sticky or "w" in sticky, "n" in sticky or "s" in sticky)
+        except (tk.TclError, KeyError, ValueError):
+            pass
+        return (False, False)
+
     def _sync_request(self, _=None):
         """让面板的自然尺寸跟着内容走（pack/grid 自适应时用）。"""
-        w = self.body.winfo_reqwidth() + 2 * self._padx
-        h = self.body.winfo_reqheight() + 2 * self._pady
-        if (w, h) != self._req:
-            self._req = (w, h)
+        stretch_x, stretch_y = self._stretched()
+        w = 0 if stretch_x else self.body.winfo_reqwidth() + 2 * self._padx
+        h = 0 if stretch_y else self.body.winfo_reqheight() + 2 * self._pady
+        if (w, h) == self._req:
+            return
+        self._req = (w, h)
+        if w and h:
             self.configure(width=w, height=h)
+        elif w:
+            self.configure(width=w)
+        elif h:
+            self.configure(height=h)
 
     def _on_configure(self, event=None):
         w, h = self.winfo_width(), self.winfo_height()
+        if (w, h) == self._geom:
+            return  # 尺寸没变就不重画：拖窗口时 Configure 会连刷几十次
+        self._geom = (w, h)
         self._paint(w, h)
         self.body.place(
             x=self._padx, y=self._pady,
@@ -118,6 +149,7 @@ class RoundButton(tk.Canvas):
         self._hover = hover or shade(self._bg, 1.18)
         self._r = radius if radius is not None else sp(12)
         self._enabled = True
+        self._painted = None
         self._poly = round_poly(self, 1, 1, self._cw - 1, self._ch - 1, self._r, fill=self._bg)
         self._text = self.create_text(self._cw / 2, self._ch / 2 + 1, text=text,
                                       fill=self._fg, font=font or F["btn"])
@@ -145,6 +177,9 @@ class RoundButton(tk.Canvas):
     def _repaint(self, fill=None):
         base = fill or (self._bg if self._enabled else mix(self._bg, C["card"], 0.76))
         fg = self._fg if self._enabled else mix(self._fg, C["card"], 0.55)
+        if (base, fg) == self._painted:
+            return  # 颜色没变就别再动画布，省一次重绘
+        self._painted = (base, fg)
         self.itemconfig(self._poly, fill=base)
         self.itemconfig(self._text, fill=fg)
 

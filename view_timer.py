@@ -1,5 +1,6 @@
 """计时器：正计时，每次暂停都要交代「这两个暂停之间你做了什么」。"""
 
+import time
 import tkinter as tk
 from datetime import datetime, timedelta
 
@@ -18,9 +19,13 @@ class TimerView(tk.Frame):
         self.app = app
         self.state = "idle"
         self.seg_start = None
+        self._mono_start = None
         self.frozen = 0.0
         self.last_secs = 0
         self._after = None
+        self._clock = "00:00"
+        self._detail_sec = -1
+        self._tl_key = None
         self._build()
         self.refresh()
         self._tick()
@@ -97,8 +102,10 @@ class TimerView(tk.Frame):
 
     # ------------------------------------------------------------------ 状态
     def elapsed(self):
-        if self.state == "running" and self.seg_start:
-            return (datetime.now() - self.seg_start).total_seconds()
+        # 用单调时钟算时长：系统时间被 NTP 校时回拨也不会出现负数/跳变。
+        # seg_start（墙钟）只用于记录时间段的起止时刻。
+        if self.state == "running" and self._mono_start is not None:
+            return max(0.0, time.monotonic() - self._mono_start)
         return self.frozen
 
     def _set_buttons(self):
@@ -135,9 +142,11 @@ class TimerView(tk.Frame):
 
     def _start(self):
         self.seg_start = datetime.now()
+        self._mono_start = time.monotonic()
         self.frozen = 0.0
         self.state = "running"
-        self.time_lbl.configure(text="00:00")
+        self._detail_sec = -1
+        self._set_clock("00:00")
         self._set_buttons()
         self._update_detail()
 
@@ -148,7 +157,7 @@ class TimerView(tk.Frame):
         self.state = "paused"
         self._set_buttons()
         if seconds >= 1:
-            self._log_segment(start, end, "计时器")
+            self._log_segment(start, end, seconds, "计时器")
 
     def _finish(self):
         if self.state == "idle":
@@ -157,27 +166,30 @@ class TimerView(tk.Frame):
         seconds = 0
         if self.state == "running":
             start, end = self.seg_start, datetime.now()
-            seconds = (end - start).total_seconds()
+            seconds = self.elapsed()
         self.state = "idle"
         self.seg_start = None
+        self._mono_start = None
         self.frozen = 0.0
-        self.time_lbl.configure(text="00:00")
+        self._set_clock("00:00")
         self._set_buttons()
         if seconds >= 1:
-            self._log_segment(start, end, "计时器")
+            self._log_segment(start, end, seconds, "计时器")
         self._update_detail()
 
     def _reset(self):
         self.state = "idle"
         self.seg_start = None
+        self._mono_start = None
         self.frozen = 0.0
-        self.time_lbl.configure(text="00:00")
+        self._set_clock("00:00")
         self._set_buttons()
         self._update_detail()
 
-    def _log_segment(self, start, end, source_label):
+    def _log_segment(self, start, end, seconds, source_label):
+        seconds = int(seconds)
         dlg = NoteDialog(self, start=start, end=end,
-                         seconds=int((end - start).total_seconds()),
+                         seconds=seconds,
                          tags=self.store.tags(), recent=self.store.recent_notes(3),
                          source=source_label)
         res = dlg.show()
@@ -185,7 +197,7 @@ class TimerView(tk.Frame):
             self.detail_lbl.configure(text="这一段没有记录（已跳过），下面继续计时即可。", fg=C["mute"])
             return
         self.store.add_segment(start, end, note=res["note"], tag=res["tag"], source="timer")
-        self.last_secs = int((end - start).total_seconds())
+        self.last_secs = seconds
         self.detail_lbl.configure(
             text="刚才那一段 %s 已记入时间线，点「继续下一段」接着走。" % fmt_span(self.last_secs),
             fg=C["dim"],
@@ -207,12 +219,21 @@ class TimerView(tk.Frame):
             self.detail_lbl.configure(text="点「开始」进入这一段，计时会一直走，直到你按下暂停。", fg=C["dim"])
 
     # ------------------------------------------------------------------ 循环
+    def _set_clock(self, text):
+        """只在显示真的变了才写 Label——每写一次都是一次整窗重绘。"""
+        if text != self._clock:
+            self._clock = text
+            self.time_lbl.configure(text=text)
+
     def _tick(self):
         self._after = self.after(200, self._tick)
-        if self.state == "running":
-            self.time_lbl.configure(text=fmt_clock(self.elapsed()))
-            if int(self.elapsed()) % 30 == 0:
-                self._update_detail()
+        if self.state != "running":
+            return
+        self._set_clock(fmt_clock(self.elapsed()))
+        secs = int(self.elapsed())
+        if secs % 30 == 0 and secs != self._detail_sec:
+            self._detail_sec = secs
+            self._update_detail()
 
     def destroy(self):
         if self._after:
@@ -231,7 +252,9 @@ class TimerView(tk.Frame):
         self.last_secs = snap.get("last_secs", 0)
         state = snap.get("state", "idle")
         if state == "running":
-            self.seg_start = datetime.now() - timedelta(seconds=snap.get("elapsed", 0))
+            elapsed = snap.get("elapsed", 0)
+            self.seg_start = datetime.now() - timedelta(seconds=elapsed)
+            self._mono_start = time.monotonic() - elapsed
             self.state = "running"
         elif state == "paused":
             self.frozen = snap.get("elapsed", 0)
@@ -240,7 +263,8 @@ class TimerView(tk.Frame):
             self.state = "idle"
         self._set_buttons()
         self._update_detail()
-        self.time_lbl.configure(text=fmt_clock(self.elapsed()))
+        self._clock = None
+        self._set_clock(fmt_clock(self.elapsed()))
 
     # ------------------------------------------------------------------ 刷新
     def refresh(self):
@@ -252,8 +276,14 @@ class TimerView(tk.Frame):
         self._fill_timeline(day)
 
     def _fill_timeline(self, day):
-        self.timeline.clear()
         segs = self.store.segments(day)
+        # 内容没变就别拆了重搭：Tk 销毁控件比改属性贵两个数量级
+        key = (day, tuple((s.get("id"), s.get("start"), s.get("end"), s.get("seconds"),
+                           s.get("note"), s.get("tag"), s.get("source")) for s in segs))
+        if key == self._tl_key:
+            return
+        self._tl_key = key
+        self.timeline.clear()
         if not segs:
             tk.Label(
                 self.timeline.inner,

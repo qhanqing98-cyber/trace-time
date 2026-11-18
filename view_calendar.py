@@ -77,6 +77,8 @@ class CalendarView(tk.Frame):
         self.grid_canvas.bind("<Configure>", lambda _e: self._draw_grid())
         self.grid_canvas.bind("<Button-1>", self._on_grid_click)
         self._day_rects = []
+        self._grid_key = None
+        self._detail_key = None
 
         right = Glass(self, padx=16, pady=16)
         right.grid(row=0, column=1, sticky="nsew", padx=(sp(9), sp(20)), pady=sp(16))
@@ -120,17 +122,31 @@ class CalendarView(tk.Frame):
                 self._select(day)
                 return
 
-    def _draw_grid(self):
+    def _draw_grid(self, stats=None, force=False):
         """整月一次性画在一个 Canvas 上，比 42 个控件快一个数量级。"""
         c = self.grid_canvas
-        c.delete("all")
-        self._day_rects = []
         w, h = c.winfo_width(), c.winfo_height()
         if w < sp(60) or h < sp(60):
             return
+        # 尺寸/月份/选中日都没变就别重画：拖动窗口时 Configure 会连刷几十次，
+        # 每次都重建 42 个圆角格子 + 42 次待办统计，是「拖起来发滞」的主因之一。
+        key = (w, h, self.year, self.month, self.selected)
+        if not force and key == self._grid_key:
+            return
+        self._grid_key = key
+        c.delete("all")
+        self._day_rects = []
 
         today = date.today()
-        stats = self.store.month_stats(self.year, self.month)
+        if stats is None:
+            stats = self.store.month_stats(self.year, self.month)
+        # 待办点数一次算清，别在 42 个格子里各扫一遍待办表
+        pending = {}
+        for todo in self.store.todos():
+            if todo.get("done"):
+                continue
+            due = todo.get("due") or ""
+            pending[due] = pending.get(due, 0) + 1
         weeks = cal.Calendar(firstweekday=0).monthdatescalendar(self.year, self.month)
         while len(weeks) < 6:
             weeks.append([None] * 7)
@@ -174,7 +190,7 @@ class CalendarView(tk.Frame):
 
             dots_x = x1 + sp(8)
             dots_y = y2 - sp(7)
-            for _ in range(min(self.store.pending_count(day.isoformat()), 3)):
+            for _ in range(min(pending.get(day.isoformat(), 0), 3)):
                 c.create_oval(dots_x, dots_y - sp(3), dots_x + sp(6), dots_y + sp(3),
                               fill=C["orange"], outline="")
                 dots_x += sp(9)
@@ -185,14 +201,24 @@ class CalendarView(tk.Frame):
             self._day_rects.append((x1, y1, x2, y2, day))
 
     def _fill_grid(self, stats):
-        self._draw_grid()
+        self._draw_grid(stats=stats, force=True)
 
     def _fill_detail(self):
-        self.detail.clear()
-        wrap = self.detail.inner
         day = self.selected
         day_key = day.isoformat()
         stats = self.store.day_stats(day_key)
+        todos_here = self.store.sorted_todos(self.store.todos_for(day_key))
+        segs = self.store.segments(day_key)
+        # 内容没变就别整块重建右侧控件（切回日历页时这里省下 100 ms 上下）
+        key = (day_key, stats["seconds"], stats["pomodoro"], stats["count"],
+               tuple((t.get("id"), bool(t.get("done")), t.get("title", "")) for t in todos_here),
+               tuple((s.get("id"), s.get("seconds"), s.get("note", "")) for s in segs))
+        if key == self._detail_key:
+            return
+        self._detail_key = key
+
+        self.detail.clear()
+        wrap = self.detail.inner
 
         head = tk.Frame(wrap, bg=C["card"])
         head.pack(fill="x")
@@ -235,7 +261,6 @@ class CalendarView(tk.Frame):
 
         divider(wrap, pady=(sp(14), sp(8)))
 
-        segs = self.store.segments(day_key)
         tk.Label(wrap, text="时间线（%d）" % len(segs), font=F["h2"], bg=C["card"],
                  fg=C["text"], anchor="w").pack(fill="x")
         if not segs:

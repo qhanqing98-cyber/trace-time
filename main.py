@@ -33,14 +33,29 @@ def parse_args(argv):
     return data, where
 
 
-def single_instance_guard():
-    """同一份数据只允许一个实例，避免两个窗口互相覆盖数据。"""
+def single_instance_guard(data_path=None):
+    """同一份数据只允许一个实例，避免两个窗口互相覆盖数据。
+
+    锁名按数据文件路径派生：不同 --data 指向不同文件时互不干扰，
+    只有真正共用同一份数据的两次启动才会互斥。
+    """
     try:
         import ctypes
+        import hashlib
+
+        if data_path:
+            try:
+                key = str(data_path.resolve()).lower()
+            except OSError:
+                key = str(data_path).lower()
+        else:
+            key = "default"
+        digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+        name = "Local\\TraceTime.SingleInstance." + digest
 
         kernel32 = ctypes.windll.kernel32
         kernel32.CreateMutexW.restype = ctypes.c_void_p
-        handle = kernel32.CreateMutexW(None, False, "Local\\TraceTime.SingleInstance")
+        handle = kernel32.CreateMutexW(None, False, name)
         already = kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
         return handle, not already
     except Exception:
@@ -74,7 +89,7 @@ def main():
         print("数据文件:", data_path)
         return 0
 
-    handle, first = single_instance_guard()
+    handle, first = single_instance_guard(data_path)
     if not first:
         alert("Trace Time 已经在运行了。\n\n"
               "同一份数据同时开两个窗口会互相覆盖，请使用已经打开的那个窗口。")

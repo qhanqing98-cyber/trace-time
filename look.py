@@ -135,7 +135,9 @@ class LookPanel(tk.Toplevel):
         Checkbox(wrap, "毛玻璃模糊（窗口背景磨砂）", self.blur_var, self._on_blur,
                  bg=C["card"]).pack(anchor="w", pady=(sp(12), 0))
 
-        tk.Label(wrap, text="透明度越低，桌面透出来越多；配毛玻璃最好看。",
+        tk.Label(wrap, text="透明度越低，桌面透出来越多；配毛玻璃最好看。\n"
+                            "但透明 + 毛玻璃都要 DWM 逐帧重新合成，是卡顿的大头，"
+                            "想更顺就点下面的「清晰模式」。",
                  font=F["tiny"], bg=C["card"], fg=C["mute"], anchor="w",
                  wraplength=sp(370), justify="left").pack(fill="x", pady=(sp(6), 0))
 
@@ -148,9 +150,19 @@ class LookPanel(tk.Toplevel):
         RoundButton(wrap, "打开数据文件夹", command=self._open_folder, width=142, height=32,
                     bg=C["card3"], fg=C["dim"], parent_bg=C["card"]).pack(anchor="w")
 
-        RoundButton(wrap, "恢复默认外观", command=self._reset, width=130, height=34,
-                    bg=C["card3"], fg=C["dim"], parent_bg=C["card"]).pack(
-            side="bottom", anchor="w", pady=(sp(8), 0))
+        bottom = tk.Frame(wrap, bg=C["card"])
+        bottom.pack(side="bottom", fill="x", pady=(sp(8), 0))
+        RoundButton(bottom, "清晰模式", command=self._clear_mode, width=110, height=34,
+                    bg=C["accent_soft"], fg=C["text"], parent_bg=C["card"]).pack(side="left")
+        RoundButton(bottom, "恢复默认外观", command=self._reset, width=130, height=34,
+                    bg=C["card3"], fg=C["dim"], parent_bg=C["card"]).pack(side="left", padx=sp(8))
+
+    def _clear_mode(self):
+        """关掉透明与毛玻璃：文字恢复 ClearType，重绘不再逐帧合成，最顺的一档。"""
+        self.app.set_clear_mode()
+        self.blur_var.set(False)
+        self.slider.set_value(1.0)
+        self.alpha_lbl.configure(text="100%")
 
     def _open_folder(self):
         import os

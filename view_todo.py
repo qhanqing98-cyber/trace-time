@@ -18,6 +18,9 @@ class TodoView(tk.Frame):
         self.app = app
         self.filter = "全部"
         self._chips = {}
+        self._rows = {}      # 待办 id → 这一行上的控件，用来原地更新而不是推倒重搭
+        self._rows_key = None
+        self._empty = None
         self._build()
         self.refresh()
 
@@ -139,13 +142,76 @@ class TodoView(tk.Frame):
         self._fill(self.store.sorted_todos(rows))
 
     def _fill(self, rows):
-        self.list.clear()
-        if not rows:
-            tk.Label(self.list.inner, text="这里空着。写下一件要做的事吧。", font=F["small"],
-                     bg=C["card"], fg=C["mute"]).pack(anchor="w", padx=sp(8), pady=sp(24))
+        """按内容差异增量更新。
+
+        Tk 销毁一个控件要 2–4 ms，原来每次刷新都把整表拆了重搭：
+        20 条待办约 200 个控件，光是销毁就要 0.4–0.8 秒，每切回待办页都卡一下。
+        现在没变的行为一个控件都不动，变了的行原地改属性。
+        """
+        key = tuple((t.get("id"), self._sig(t)) for t in rows)
+        if key == self._rows_key:
             return
+        self._rows_key = key
+
+        if self._empty is not None:
+            self._empty.destroy()
+            self._empty = None
+
+        keep = set()
         for todo in rows:
-            self._row(todo)
+            tid = todo.get("id")
+            handles = self._rows.get(tid)
+            if handles is None:
+                handles = self._row(todo)
+                self._rows[tid] = handles
+            elif handles["sig"] != self._sig(todo):
+                self._update_row(handles, todo)
+            keep.add(tid)
+            handles["outer"].pack(fill="x", pady=sp(3))  # 按新顺序重排（pack 顺序即显示顺序）
+
+        # 不在当前筛选里的行先藏起来留着下次用——销毁一个控件比藏起来贵上百倍，
+        # 只有待办真的被删掉了才销毁。
+        alive = {t.get("id") for t in self.store.todos()}
+        for tid, handles in list(self._rows.items()):
+            if tid in keep:
+                continue
+            if tid in alive:
+                handles["outer"].pack_forget()
+            else:
+                handles["outer"].destroy()
+                del self._rows[tid]
+
+        if not rows:
+            self._empty = tk.Label(self.list.inner, text="这里空着。写下一件要做的事吧。",
+                                   font=F["small"], bg=C["card"], fg=C["mute"])
+            self._empty.pack(anchor="w", padx=sp(8), pady=sp(24))
+
+    # ------------------------------------------------------------ 一行的拆解
+    @staticmethod
+    def _sig(todo):
+        """换行需要的全部信息：任何一项变了，这一行才需要动。"""
+        return (bool(todo.get("done")), todo.get("title") or "", todo.get("due") or "",
+                todo.get("priority") or "", todo.get("tag") or "", todo.get("done_at") or "")
+
+    def _meta_sig(self, todo):
+        return (bool(todo.get("done")), todo.get("priority") or "", todo.get("due") or "",
+                todo.get("tag") or "", todo.get("done_at") or "")
+
+    def _find(self, tid):
+        for rec in self.store.todos():
+            if rec.get("id") == tid:
+                return rec
+        return None
+
+    def _edit_id(self, tid):
+        todo = self._find(tid)
+        if todo is not None:
+            self._edit(todo)
+
+    def _delete_id(self, tid):
+        todo = self._find(tid)
+        if todo is not None:
+            self._delete(todo)
 
     def _row(self, todo):
         done = bool(todo.get("done"))
@@ -154,41 +220,69 @@ class TodoView(tk.Frame):
         row = outer.body
         row.grid_columnconfigure(1, weight=1)
 
-        CheckCircle(row, checked=done, size=24, bg=C["card2"],
-                    command=lambda t=todo: self.store.toggle_todo(t["id"])).grid(
-            row=0, column=0, rowspan=2, padx=(0, sp(10)), sticky="n")
+        check = CheckCircle(row, checked=done, size=24, bg=C["card2"],
+                            command=lambda tid=todo.get("id"): self.store.toggle_todo(tid))
+        check.grid(row=0, column=0, rowspan=2, padx=(0, sp(10)), sticky="n")
 
         title = tk.Label(row, text=todo.get("title", ""),
                          font=F["small_strike"] if done else F["body"],
                          bg=C["card2"], fg=C["mute"] if done else C["text"],
                          anchor="w", justify="left", wraplength=sp(520))
         title.grid(row=0, column=1, sticky="w")
-        title.bind("<Double-Button-1>", lambda _e, t=todo: self._edit(t))
+        title.bind("<Double-Button-1>", lambda _e, tid=todo.get("id"): self._edit_id(tid))
 
         meta = tk.Frame(row, bg=C["card2"])
         meta.grid(row=1, column=1, sticky="w", pady=(sp(4), 0))
-        if not done and todo.get("priority"):
-            key = todo.get("priority", "mid")
-            Pill(meta, PRIORITY_LABEL.get(key, "中") + "优先",
-                 color=PRIORITY_COLOR.get(key, C["accent"]), bg=C["card2"]).pack(side="left", padx=(0, sp(6)))
-        due = todo.get("due", "")
-        if due:
-            overdue = (not done) and due < today_str()
-            Pill(meta, ("逾期 " if overdue else "") + due,
-                 color=C["red"] if overdue else C["dim"], bg=C["card2"]).pack(side="left", padx=(0, sp(6)))
-        if todo.get("tag"):
-            Pill(meta, "#" + todo["tag"], color=C["purple"], bg=C["card2"]).pack(side="left", padx=(0, sp(6)))
-        if todo.get("done_at"):
-            tk.Label(meta, text="完成于 " + todo["done_at"][:10], font=F["tiny"],
-                     bg=C["card2"], fg=C["mute"]).pack(side="left")
+        self._fill_meta(meta, todo)
 
         acts = tk.Frame(row, bg=C["card2"])
         acts.grid(row=0, column=2, rowspan=2, padx=(sp(10), 0), sticky="e")
-        for text, cmd, color in (("改", lambda t=todo: self._edit(t), C["dim"]),
-                                 ("删", lambda t=todo: self._delete(t), C["red"])):
+        for text, cmd, color in (("改", lambda tid=todo.get("id"): self._edit_id(tid), C["dim"]),
+                                 ("删", lambda tid=todo.get("id"): self._delete_id(tid), C["red"])):
             btn = tk.Label(acts, text=text, font=F["small"], bg=C["card2"], fg=color,
                            cursor="hand2", padx=sp(6), pady=sp(4))
             btn.pack(side="left", padx=sp(2))
             btn.bind("<Button-1>", lambda _e, c=cmd: c())
             btn.bind("<Enter>", lambda e: e.widget.configure(bg=C["card3"]))
             btn.bind("<Leave>", lambda e: e.widget.configure(bg=C["card2"]))
+
+        return {"outer": outer, "check": check, "title": title, "meta": meta,
+                "sig": self._sig(todo), "meta_sig": self._meta_sig(todo)}
+
+    def _update_row(self, handles, todo):
+        """行还在，只是内容变了：改属性比重建便宜两个数量级。"""
+        done = bool(todo.get("done"))
+        handles["check"].set(done)
+        handles["title"].configure(
+            text=todo.get("title", ""),
+            font=F["small_strike"] if done else F["body"],
+            fg=C["mute"] if done else C["text"],
+        )
+        meta_sig = self._meta_sig(todo)
+        if meta_sig != handles["meta_sig"]:
+            handles["meta_sig"] = meta_sig
+            self._fill_meta(handles["meta"], todo)
+        handles["sig"] = self._sig(todo)
+
+    def _fill_meta(self, meta, todo):
+        """优先级 / 日期 / 标签这几个小胶囊，只在它们变了的时候重建。"""
+        for child in meta.winfo_children():
+            child.destroy()
+        done = bool(todo.get("done"))
+        if not done and todo.get("priority"):
+            key = todo.get("priority", "mid")
+            Pill(meta, PRIORITY_LABEL.get(key, "中") + "优先",
+                 color=PRIORITY_COLOR.get(key, C["accent"]), bg=C["card2"]).pack(
+                side="left", padx=(0, sp(6)))
+        due = todo.get("due", "")
+        if due:
+            overdue = (not done) and due < today_str()
+            Pill(meta, ("逾期 " if overdue else "") + due,
+                 color=C["red"] if overdue else C["dim"], bg=C["card2"]).pack(
+                side="left", padx=(0, sp(6)))
+        if todo.get("tag"):
+            Pill(meta, "#" + todo["tag"], color=C["purple"], bg=C["card2"]).pack(
+                side="left", padx=(0, sp(6)))
+        if todo.get("done_at"):
+            tk.Label(meta, text="完成于 " + todo["done_at"][:10], font=F["tiny"],
+                     bg=C["card2"], fg=C["mute"]).pack(side="left")
